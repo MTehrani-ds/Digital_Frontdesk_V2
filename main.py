@@ -29,8 +29,13 @@ class Collected(BaseModel):
 class SessionState(BaseModel):
     step: Step = Step.LIMITED_RESPONSE
     procedure: Optional[str] = None
-    intent: Optional[str] = None  # used for "context carryover" (e.g., pricing -> service selection)
+    intent: Optional[str] = None  # context carryover (e.g., pricing -> service selection)
     collected: Collected = Field(default_factory=Collected)
+
+    # NEW: store what the patient asked (for staff ticket context)
+    topic: Optional[str] = None
+    initial_question: Optional[str] = None
+    last_question: Optional[str] = None
 
 
 class IncomingMessage(BaseModel):
@@ -70,7 +75,7 @@ class Ticket(BaseModel):
     best_time: str
     summary: str
     status: str = "OPEN"
-    ticket_type: str = "CALLBACK"  # e.g., APPOINTMENT / CANCEL / EMERGENCY / CALLBACK
+    ticket_type: str = "CALLBACK"  # APPOINTMENT / CANCEL / EMERGENCY / CALLBACK
 
 
 TICKET_DB: List[Ticket] = []
@@ -106,7 +111,7 @@ def create_ticket(
 # App + error handler
 # ============================================================
 
-app = FastAPI(title="Digital Frontdesk – Dental Clinic Demo", version="1.0.0")
+app = FastAPI(title="Digital Frontdesk – Dental Clinic Demo", version="1.1.0")
 
 
 @app.exception_handler(Exception)
@@ -177,7 +182,7 @@ def is_medical_or_medication_question(text: str) -> bool:
         "antibiotic", "antibiotics", "amoxicillin", "penicillin", "clindamycin",
         "medicine", "medication", "dose", "dosage", "should i",
         "ibuprofen", "painkiller", "prescription",
-        "diagnose", "is this an abscess", "abscess", "infection",
+        "diagnose", "abscess", "infection",
     ]
     return any(k in t for k in keywords)
 
@@ -300,10 +305,34 @@ def normalize_service(text: str) -> Optional[str]:
     for service, keys in mapping.items():
         if any(k in t for k in keys):
             return service
-    # accept single-word quick replies
     if t in ["implant", "implants", "cleaning", "filling", "checkup", "check-up"]:
         return t.replace("check-up", "checkup").rstrip("s")
     return None
+
+
+# ============================================================
+# Ticket context helpers
+# ============================================================
+
+def looks_like_contact_message(text: str) -> bool:
+    t = text.lower()
+    has_labels = any(x in t for x in ["name:", "phone:", "tel:", "mobile:", "best time"])
+    digits = sum(ch.isdigit() for ch in text)
+    return has_labels or digits >= 7
+
+
+def set_topic_from_faq_key(state: SessionState, key: str) -> None:
+    mapping = {
+        "pricing_insurance": "Pricing / insurance",
+        "booking": "Appointment request",
+        "reschedule_cancel": "Cancel / reschedule",
+        "emergency": "Urgent dental issue",
+        "services": "Services inquiry",
+        "hours": "Opening hours",
+        "location_parking": "Location / parking",
+        "what_to_bring": "First visit / documents",
+    }
+    state.topic = mapping.get(key, state.topic or "General inquiry")
 
 
 # ============================================================
@@ -311,13 +340,6 @@ def normalize_service(text: str) -> Optional[str]:
 # ============================================================
 
 def update_collected_from_text(state: SessionState, user_text: str) -> SessionState:
-    """
-    Demo-safe extraction (no AI):
-    - Supports: "My name is Alex", "I'm Alex", "I am Alex"
-    - Supports label style: "Name: Alex, Phone: +43..., Best time: tomorrow morning"
-    - Phone: extracts digits/+ (simple)
-    - Best time: extracts the part after "best time" or uses short phrase fallback
-    """
     if state.collected is None:
         state.collected = Collected()
 
@@ -415,11 +437,17 @@ def update_collected_from_text(state: SessionState, user_text: str) -> SessionSt
 # ============================================================
 
 def next_reply(practice_name: str, user_text: str, state: SessionState) -> tuple[str, SessionState]:
+    # Remember question context (ignore contact-only messages)
+    if not looks_like_contact_message(user_text):
+        state.last_question = user_text.strip()[:240]
+        if not state.initial_question:
+            state.initial_question = state.last_question
+
     # 1) Policy gate (medical/medication)
     if is_medical_or_medication_question(user_text):
         state.step = Step.LIMITED_RESPONSE
-        # Clear any pending "pricing" intent if user goes into clinical territory
         state.intent = None
+        set_topic_from_faq_key(state, "emergency")  # closest "staff-relevant" topic
         return limited_response_policy(practice_name), state
 
     # 2) Context carryover: pricing -> service selection
@@ -427,8 +455,10 @@ def next_reply(practice_name: str, user_text: str, state: SessionState) -> tuple
         service = normalize_service(user_text)
         if service:
             state.intent = None
-            # move into contact flow (so we can create ticket after details)
             state.step = Step.COLLECT_CONTACT
+            state.topic = "Pricing / insurance"
+            # store the service in last_question context too (useful for summary)
+            state.last_question = f"Service: {service}"
             return (
                 f"Got it — **{service}**.\n\n"
                 f"Coverage and costs depend on insurance status and clinical assessment. {CLINIC['insurance']}\n\n"
@@ -442,16 +472,14 @@ def next_reply(practice_name: str, user_text: str, state: SessionState) -> tuple
     faq = match_faq_intent(user_text)
     if faq:
         answer = faq["answer"]()
+        set_topic_from_faq_key(state, faq["key"])
 
-        # Set intent when needed (pricing follow-up)
         if faq.get("sets_intent"):
             state.intent = faq["sets_intent"]
 
-        # Some intents should force contact collection (booking/cancel/emergency)
         forces_contact = bool(faq.get("forces_contact_flow"))
         if forces_contact:
             state.step = Step.COLLECT_CONTACT
-            # Try to capture contact from same message if present
             state = update_collected_from_text(state, user_text)
 
             missing = []
@@ -466,7 +494,6 @@ def next_reply(practice_name: str, user_text: str, state: SessionState) -> tuple
                 answer += "\n\nTo proceed, I still need your " + ", ".join(missing) + "."
                 return answer, state
 
-            # If already complete, handoff immediately
             state.step = Step.HANDOFF
             return (
                 f"{answer}\n\n"
@@ -477,11 +504,11 @@ def next_reply(practice_name: str, user_text: str, state: SessionState) -> tuple
                 state,
             )
 
-        # Simple FAQ: if not in contact flow, answer and stop
+        # Simple FAQ response
         if state.step != Step.COLLECT_CONTACT:
             return answer, state
 
-        # If already collecting contact, answer FAQ but remind missing fields
+        # If collecting contact, remind missing fields
         missing = []
         if not state.collected.name:
             missing.append("name")
@@ -538,7 +565,7 @@ def health() -> Dict[str, str]:
 @app.post("/webchat/message", response_model=OutgoingMessage)
 def webchat_message(payload: IncomingMessage) -> OutgoingMessage:
     old_state = get_state(payload)
-    old_step = old_state.step  # IMPORTANT: snapshot before state is mutated inside next_reply()
+    old_step = old_state.step  # snapshot BEFORE mutation in next_reply
 
     reply, new_state = next_reply(payload.practice_name, payload.user_message, old_state)
     save_state(payload.session_id, new_state)
@@ -547,18 +574,28 @@ def webchat_message(payload: IncomingMessage) -> OutgoingMessage:
 
     # Create ticket ONLY on transition into HANDOFF
     if old_step != Step.HANDOFF and new_state.step == Step.HANDOFF:
+        # Derive ticket type from topic (preferred) or keywords
         ticket_type = "CALLBACK"
-
-        # derive ticket_type based on common intents/keywords (simple demo heuristic)
-        t = payload.user_message.lower()
-        if any(k in t for k in ["cancel", "reschedule", "change appointment"]):
-            ticket_type = "CANCEL"
-        elif any(k in t for k in ["appointment", "book", "booking", "schedule"]):
+        if (new_state.topic or "").lower().startswith("appointment"):
             ticket_type = "APPOINTMENT"
-        elif any(k in t for k in ["emergency", "urgent", "swelling", "bleeding", "fever"]):
+        elif "cancel" in (new_state.topic or "").lower():
+            ticket_type = "CANCEL"
+        elif "urgent" in (new_state.topic or "").lower():
             ticket_type = "EMERGENCY"
 
-        summary = f"Callback requested. Latest user message: {payload.user_message[:180]}"
+        # Build a staff-friendly summary using remembered context
+        topic = new_state.topic or "General inquiry"
+        initial_q = new_state.initial_question or ""
+        last_q = new_state.last_question or ""
+
+        parts = [f"Topic: {topic}"]
+        if initial_q:
+            parts.append(f"Initial: {initial_q}")
+        if last_q and last_q != initial_q:
+            parts.append(f"Latest: {last_q}")
+
+        summary = " | ".join(parts)
+
         ticket = create_ticket(
             payload.session_id,
             payload.practice_name,
@@ -588,11 +625,8 @@ def webchat_message(payload: IncomingMessage) -> OutgoingMessage:
 @app.post("/admin/reset_session/{session_id}")
 def reset_session(session_id: str) -> Dict[str, Any]:
     SESSION_DB.pop(session_id, None)
-
-    # remove tickets linked to this session (demo convenience)
     global TICKET_DB
     TICKET_DB = [t for t in TICKET_DB if t.session_id != session_id]
-
     return {"ok": True, "session_id": session_id}
 
 
@@ -652,7 +686,7 @@ def staff_dashboard():
               <th>Name</th>
               <th>Phone</th>
               <th>Best time</th>
-              <th>Summary</th>
+              <th>Reason / Summary</th>
               <th>Status</th>
             </tr>
           </thead>
